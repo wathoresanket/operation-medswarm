@@ -1,34 +1,31 @@
-# python stuff
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 dist/
 build/
-*.egg
-.eggs/
 
-# virtual env
+# Virtual environments
 venv/
 env/
-.venv/
-
-# generated during runtime — don't commit these
-data/
-models/
-logs/
-
-# jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# OS
-.DS_Store
-Thumbs.db
+ENV/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# secrets
-.env
-*.key
+# Auto-generated from training
+models/
+logs/
+data/medswarm_data.pkl
+
+# OS
+.DS_Store
+.cache/
+cache/
+
+# Jupyter
+.ipynb_checkpoints/

@@ -546,34 +546,37 @@ Mean steps:       200.0
 Success rate:     0.0%
 ```
 
-**Causes:**
-1. **Old model checkpoint** incompatible with new observation space (15D → 18D)
-2. **Old training** used different reward structure (distance_penalty vs per_step_penalty)
-3. **Network mismatch** — old model expects [64,64] network, new code uses [256,256,128]
+**Root Cause:** Old model checkpoint incompatible with new architecture (15D → 18D observations, different rewards, [64,64] → [256,256,128] network).
 
-**Solution:**
+**CRITICAL FIX — Fresh Retrain from Scratch:**
+
 ```bash
-# Step 1: Delete old models and logs
+# Step 1: Clean old artifacts
 rm -rf models/* logs/*
 
-# Step 2: Verify data is prepared
+# Step 2: Prepare data
 python scripts/prepare_data.py
 
-# Step 3: Start FRESH training from scratch
+# Step 3: Train fresh (CPU: 30-35 min, GPU: 8-12 min)
 python scripts/train.py
 
-# Step 4: Monitor progress (success rate should climb 0% → 20% → 50% → 80%+)
-# Check logs/ every 50k steps
+# Step 4: Monitor progress
+# Expected success rate progression:
+#   50k steps: 2-5%
+#   100k steps: 5-15%
+#   150k steps: 20-35%
+#   200k steps: 40-55%
+#   250k steps: 60-75%
+#   300k steps: 80-85% ✅
 ```
 
-**Why this happens:** RL agents memorize the model architecture and state space. Changing either requires retraining from scratch. You can't "fine-tune" an old model into a new observation/reward structure.
+**Why this works:** RL agents memorize state space and network architecture. Any change requires retraining from scratch — you can't "fine-tune" across architecture changes.
 
-**Expected result after fresh training:**
+**Target result after fresh training:**
 ```
-Step 50k:   Success rate rising to 5-10%
-Step 100k:  Success rate  20-30%
-Step 200k:  Success rate 60-75%
-Step 300k:  Success rate 80-85%
+Mean reward:      2800.0
+Mean steps:        18.0
+Success rate:      85.0%
 ```
 
 ---

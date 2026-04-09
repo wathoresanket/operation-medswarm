@@ -304,7 +304,9 @@ def evaluate_model(model_path, data_path, config_path="config/config.yaml", n_ep
         done = False
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
+            # Use deterministic=False to match training evaluation
+            # (training uses stochastic evaluation with EvalCallback)
+            action, _ = model.predict(obs, deterministic=False)
             obs, reward, terminated, truncated, info = env.step(action)
             ep_reward += reward
             step += 1
