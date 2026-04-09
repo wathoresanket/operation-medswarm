@@ -1,359 +1,284 @@
 """
-MedSwarm Training Module
-=========================
-PPO training pipeline with comprehensive logging and callbacks.
+trainer.py
+
+Everything related to training the PPO agent lives here.
+
+PPO (Proximal Policy Optimization) is the algorithm that teaches the agent
+how to act. It's like a student that:
+1. Tries stuff (rollout)
+2. Sees what worked and what didn't (reward)
+3. Updates its brain a little bit (gradient step)
+4. Repeat
+
+We use Stable-Baselines3 which gives us a clean, ready-to-use PPO implementation.
+We just plug in our custom environment and it handles the rest.
 """
 
 import os
-import json
-from datetime import datetime
-from typing import Optional, Dict, Any
-from dataclasses import dataclass, asdict
-
+import yaml
 import numpy as np
+from pathlib import Path
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
-    BaseCallback, 
-    EvalCallback, 
+    EvalCallback,
     CheckpointCallback,
-    CallbackList
+    BaseCallback,
 )
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.logger import configure
 
 from medswarm.environment.medswarm_env import MedSwarmEnv
 
 
-@dataclass
-class TrainingConfig:
-    """Configuration for training."""
-    # PPO Hyperparameters
-    algorithm: str = "PPO"
-    total_timesteps: int = 300000
-    learning_rate: float = 0.0003
-    n_steps: int = 2048
-    batch_size: int = 64
-    n_epochs: int = 10
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    ent_coef: float = 0.01
-    
-    # Environment settings
-    n_envs: int = 4
-    data_path: str = "data/medswarm_data.pkl"
-    
-    # Evaluation settings
-    eval_freq: int = 5000
-    n_eval_episodes: int = 10
-    
-    # Logging settings
-    log_path: str = "logs/"
-    model_path: str = "models/"
-    save_freq: int = 10000
-    verbose: int = 1
+# ------------------------------------------------------------------ #
+#  Custom Callback — prints progress every N steps                    #
+# ------------------------------------------------------------------ #
 
+class ProgressCallback(BaseCallback):
+    """
+    Prints a friendly progress update every 10,000 steps.
+    Also tracks mean reward so we can see the agent improving.
+    """
 
-class MetricsCallback(BaseCallback):
-    """
-    Custom callback for tracking and saving detailed training metrics.
-    """
-    
-    def __init__(self, save_path: str, save_freq: int = 1000, verbose: int = 0):
+    def __init__(self, total_steps, verbose=0):
         super().__init__(verbose)
-        self.save_path = save_path
-        self.save_freq = save_freq
-        self.metrics = {
-            "timesteps": [],
-            "episodes": [],
-            "mean_reward": [],
-            "std_reward": [],
-            "mean_length": [],
-            "success_rate": [],
-            "battery_failures": [],
-            "mission_completes": []
-        }
+        self.total_steps = total_steps
+        self.print_every = 10000
         self.episode_rewards = []
-        self.episode_lengths = []
-        self.episode_outcomes = []
-        
-    def _on_step(self) -> bool:
-        # Collect episode info from the Monitor wrapper
-        if len(self.model.ep_info_buffer) > 0:
-            ep_info = self.model.ep_info_buffer[-1]
-            self.episode_rewards.append(ep_info.get('r', 0))
-            self.episode_lengths.append(ep_info.get('l', 0))
-            
-        # Save metrics periodically
-        if self.n_calls % self.save_freq == 0 and len(self.episode_rewards) > 0:
-            self.metrics["timesteps"].append(self.num_timesteps)
-            self.metrics["episodes"].append(len(self.episode_rewards))
-            self.metrics["mean_reward"].append(float(np.mean(self.episode_rewards[-100:])))
-            self.metrics["std_reward"].append(float(np.std(self.episode_rewards[-100:])))
-            self.metrics["mean_length"].append(float(np.mean(self.episode_lengths[-100:])))
-            
-            # Save to JSON
-            self._save_metrics()
-            
-        return True
-    
-    def _save_metrics(self):
-        """Save metrics to JSON file."""
-        os.makedirs(self.save_path, exist_ok=True)
-        metrics_file = os.path.join(self.save_path, "training_metrics.json")
-        with open(metrics_file, 'w') as f:
-            json.dump(self.metrics, f, indent=2)
-            
-    def _on_training_end(self):
-        """Save final metrics on training end."""
-        self._save_metrics()
+        self.current_episode_reward = 0.0
+
+    def _on_step(self):
+        # accumulate reward for current episode
+        rewards = self.locals.get("rewards", [0])
+        self.current_episode_reward += float(np.mean(rewards))
+
+        dones = self.locals.get("dones", [False])
+        if any(dones):
+            self.episode_rewards.append(self.current_episode_reward)
+            self.current_episode_reward = 0.0
+
+        # print every N steps
+        if self.num_timesteps % self.print_every == 0:
+            pct = (self.num_timesteps / self.total_steps) * 100
+            if len(self.episode_rewards) > 0:
+                recent_mean = np.mean(self.episode_rewards[-20:])
+                print(
+                    f"  [{pct:5.1f}%]  Step {self.num_timesteps:>7,} / {self.total_steps:,}"
+                    f"  |  Mean reward (last 20 eps): {recent_mean:>8.1f}"
+                )
+            else:
+                print(f"  [{pct:5.1f}%]  Step {self.num_timesteps:>7,} / {self.total_steps:,}")
+
+        return True  # return True to keep training going
 
 
-class MedSwarmTrainer:
+# ------------------------------------------------------------------ #
+#  Make environment factory (needed for vectorized envs)             #
+# ------------------------------------------------------------------ #
+
+def make_env(data_path, config):
     """
-    Comprehensive trainer for the MedSwarm environment.
-    
-    Handles environment setup, model initialization, training with callbacks,
-    and logging of all relevant metrics.
+    Returns a function that creates one MedSwarmEnv instance.
+    Stable-Baselines3 needs this pattern for parallel environments.
     """
-    
-    def __init__(self, config: Optional[TrainingConfig] = None):
-        """
-        Initialize the trainer.
-        
-        Args:
-            config: Training configuration (uses defaults if not provided)
-        """
-        self.config = config or TrainingConfig()
-        self.model: Optional[PPO] = None
-        self.env = None
-        self.eval_env = None
-        
-        # Create directories
-        os.makedirs(self.config.log_path, exist_ok=True)
-        os.makedirs(self.config.model_path, exist_ok=True)
-        
-        # Save config
-        self._save_config()
-        
-    def _save_config(self):
-        """Save training configuration to JSON."""
-        config_path = os.path.join(self.config.log_path, "training_config.json")
-        with open(config_path, 'w') as f:
-            json.dump(asdict(self.config), f, indent=2)
-            
-    def setup_environment(self):
-        """Set up training and evaluation environments."""
-        print("🏥 Setting up MedSwarm environments...")
-        
-        # Create vectorized training environment
-        def make_env():
-            env = MedSwarmEnv(data_path=self.config.data_path)
-            return Monitor(env)
-        
-        self.env = make_vec_env(make_env, n_envs=self.config.n_envs)
-        
-        # Create evaluation environment
-        self.eval_env = Monitor(
-            MedSwarmEnv(data_path=self.config.data_path),
-            filename=os.path.join(self.config.log_path, "eval")
-        )
-        
-        print(f"✅ Environments ready ({self.config.n_envs} parallel training envs)")
-        
-    def setup_model(self):
-        """Initialize the PPO model."""
-        print("🤖 Initializing PPO agent...")
-        
-        # Configure logger
-        logger = configure(self.config.log_path, ["stdout", "csv", "tensorboard"])
-        
-        self.model = PPO(
-            "MlpPolicy",
-            self.env,
-            learning_rate=self.config.learning_rate,
-            n_steps=self.config.n_steps,
-            batch_size=self.config.batch_size,
-            n_epochs=self.config.n_epochs,
-            gamma=self.config.gamma,
-            gae_lambda=self.config.gae_lambda,
-            clip_range=self.config.clip_range,
-            ent_coef=self.config.ent_coef,
-            verbose=self.config.verbose,
-            tensorboard_log=os.path.join(self.config.log_path, "tensorboard")
-        )
-        self.model.set_logger(logger)
-        
-        print("✅ PPO agent initialized")
-        
-    def setup_callbacks(self) -> CallbackList:
-        """Set up training callbacks."""
-        callbacks = []
-        
-        # Evaluation callback
-        eval_callback = EvalCallback(
-            self.eval_env,
-            best_model_save_path=self.config.model_path,
-            log_path=self.config.log_path,
-            eval_freq=self.config.eval_freq,
-            n_eval_episodes=self.config.n_eval_episodes,
-            deterministic=True,
-            render=False
-        )
-        callbacks.append(eval_callback)
-        
-        # Checkpoint callback
-        checkpoint_callback = CheckpointCallback(
-            save_freq=self.config.save_freq,
-            save_path=self.config.model_path,
-            name_prefix="medswarm_checkpoint"
-        )
-        callbacks.append(checkpoint_callback)
-        
-        # Custom metrics callback
-        metrics_callback = MetricsCallback(
-            save_path=self.config.log_path,
-            save_freq=1000,
-            verbose=self.config.verbose
-        )
-        callbacks.append(metrics_callback)
-        
-        return CallbackList(callbacks)
-    
-    def train(self) -> PPO:
-        """
-        Run the complete training pipeline.
-        
-        Returns:
-            Trained PPO model
-        """
-        print("\n" + "="*60)
-        print("🚀 OPERATION MEDSWARM - TRAINING INITIATED")
-        print("="*60 + "\n")
-        
-        # Setup
-        self.setup_environment()
-        self.setup_model()
-        callbacks = self.setup_callbacks()
-        
-        # Training
-        print(f"\n📈 Starting training for {self.config.total_timesteps:,} timesteps...")
-        start_time = datetime.now()
-        
-        self.model.learn(
-            total_timesteps=self.config.total_timesteps,
-            callback=callbacks,
-            progress_bar=True
-        )
-        
-        training_time = datetime.now() - start_time
-        
-        # Save final model
-        final_model_path = os.path.join(self.config.model_path, "medswarm_final")
-        self.model.save(final_model_path)
-        
-        print("\n" + "="*60)
-        print("✅ TRAINING COMPLETE")
-        print(f"   Duration: {training_time}")
-        print(f"   Final model saved: {final_model_path}")
-        print("="*60 + "\n")
-        
-        return self.model
-    
-    def evaluate(self, n_episodes: int = 10, render: bool = False) -> Dict[str, Any]:
-        """
-        Evaluate the trained model.
-        
-        Args:
-            n_episodes: Number of episodes to evaluate
-            render: Whether to render during evaluation
-            
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        if self.model is None:
-            raise ValueError("Model not trained. Call train() first.")
-            
-        print(f"\n📊 Evaluating model for {n_episodes} episodes...")
-        
-        env = MedSwarmEnv(data_path=self.config.data_path, render_mode="human" if render else None)
-        
-        rewards = []
-        lengths = []
-        outcomes = []
-        
-        for ep in range(n_episodes):
-            obs, _ = env.reset()
-            done = False
-            episode_reward = 0
-            episode_length = 0
-            
-            while not done:
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                episode_reward += reward
-                episode_length += 1
-                done = terminated or truncated
-                
-                if render:
-                    env.render()
-                    
-            rewards.append(episode_reward)
-            lengths.append(episode_length)
-            outcomes.append(info.get("termination_reason", "unknown"))
-            
-        env.close()
-        
-        results = {
-            "mean_reward": np.mean(rewards),
-            "std_reward": np.std(rewards),
-            "mean_length": np.mean(lengths),
-            "success_rate": outcomes.count("mission_complete") / n_episodes,
-            "battery_failure_rate": outcomes.count("battery_depleted") / n_episodes
-        }
-        
-        print(f"   Mean Reward: {results['mean_reward']:.2f} ± {results['std_reward']:.2f}")
-        print(f"   Success Rate: {results['success_rate']*100:.1f}%")
-        
-        return results
-    
-    def load_model(self, model_path: str):
-        """Load a pre-trained model."""
-        self.model = PPO.load(model_path)
-        print(f"✅ Model loaded from: {model_path}")
+    env_config = {
+        "max_battery": config["environment"]["max_battery"],
+        "max_steps": config["environment"].get("max_steps_per_episode", 100),
+        "reward": config["environment"]["reward"],
+    }
+
+    def _init():
+        env = MedSwarmEnv(data_path=data_path, config=env_config)
+        env = Monitor(env)  # wraps env to track episode stats
+        return env
+
+    return _init
 
 
-def main():
-    """CLI entry point for training."""
-    import argparse
+# ------------------------------------------------------------------ #
+#  Main training function                                             #
+# ------------------------------------------------------------------ #
+
+def train(config_path="config/config.yaml"):
+    """
+    Full training pipeline. Call this from scripts/train.py.
     
-    parser = argparse.ArgumentParser(description="Train MedSwarm RL agent")
-    parser.add_argument("--timesteps", type=int, default=300000,
-                        help="Total training timesteps")
-    parser.add_argument("--lr", type=float, default=0.0003,
-                        help="Learning rate")
-    parser.add_argument("--n-envs", type=int, default=4,
-                        help="Number of parallel environments")
-    parser.add_argument("--eval-freq", type=int, default=5000,
-                        help="Evaluation frequency")
-    parser.add_argument("--data-path", default="data/medswarm_data.pkl",
-                        help="Path to data file")
+    1. Load config
+    2. Create vectorized environments (N parallel copies for faster collection)
+    3. Build PPO model
+    4. Train for total_timesteps
+    5. Save the final model
+    """
+
+    print("=" * 50)
+    print("MedSwarm — PPO Training")
+    print("=" * 50)
+
+    # load config
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    train_cfg = config["training"]
+    data_path = config["data"]["output_path"]
+    model_save_path = train_cfg["model_save_path"]
+    log_path = train_cfg["log_path"]
+
+    # make sure output dirs exist
+    Path(model_save_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(log_path).mkdir(parents=True, exist_ok=True)
+
+    # check data file exists
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"Data file not found: {data_path}\n"
+            "Run 'python scripts/prepare_data.py' first!"
+        )
+
+    print(f"\n  Data: {data_path}")
+    print(f"  Total timesteps: {train_cfg['total_timesteps']:,}")
+    print(f"  Parallel envs: {train_cfg['n_envs']}")
+    print(f"  Learning rate: {train_cfg['learning_rate']}")
+
+    # ---- Build vectorized training environment ----
+    # n_envs parallel environments collect experience simultaneously
+    # this makes training ~4x faster vs a single environment
+    print(f"\n  Creating {train_cfg['n_envs']} parallel environments...")
     
-    args = parser.parse_args()
-    
-    config = TrainingConfig(
-        total_timesteps=args.timesteps,
-        learning_rate=args.lr,
-        n_envs=args.n_envs,
-        eval_freq=args.eval_freq,
-        data_path=args.data_path
+    vec_env = make_vec_env(
+        make_env(data_path, config),
+        n_envs=train_cfg["n_envs"],
     )
+
+    # ---- Evaluation environment (single env, no parallel) ----
+    eval_env = make_vec_env(
+        make_env(data_path, config),
+        n_envs=1,
+    )
+
+    # ---- Callbacks ----
+    # EvalCallback: runs the agent on eval_env every eval_freq steps
+    #               saves the best model automatically
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=f"{model_save_path}_best",
+        log_path=log_path,
+        eval_freq=max(train_cfg["eval_freq"] // train_cfg["n_envs"], 1),
+        n_eval_episodes=train_cfg["eval_episodes"],
+        deterministic=True,
+        verbose=1,
+    )
+
+    # CheckpointCallback: saves model every 50k steps (backup in case training crashes)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=max(50000 // train_cfg["n_envs"], 1),
+        save_path=log_path,
+        name_prefix="ppo_medswarm_checkpoint",
+    )
+
+    progress_callback = ProgressCallback(
+        total_steps=train_cfg["total_timesteps"]
+    )
+
+    # ---- Build the PPO model ----
+    # "MlpPolicy" = multi-layer perceptron — a simple feedforward neural net
+    # this is the agent's "brain" — takes observation → outputs action probabilities
+    print("\n  Building PPO model (MLP policy)...")
     
-    trainer = MedSwarmTrainer(config)
-    trainer.train()
-    trainer.evaluate(n_episodes=10)
+    model = PPO(
+        policy="MlpPolicy",
+        env=vec_env,
+        learning_rate=train_cfg["learning_rate"],
+        n_steps=train_cfg["n_steps"],
+        batch_size=train_cfg["batch_size"],
+        n_epochs=train_cfg["n_epochs"],
+        gamma=train_cfg["gamma"],
+        clip_range=train_cfg["clip_range"],
+        verbose=0,           # we handle our own printing
+        tensorboard_log=log_path,
+    )
+
+    print(f"  Policy network: {model.policy}")
+    print(f"\n  Starting training... (this takes a while, grab some chai ☕)")
+    print("-" * 50)
+
+    # ---- Train ----
+    model.learn(
+        total_timesteps=train_cfg["total_timesteps"],
+        callback=[eval_callback, checkpoint_callback, progress_callback],
+        progress_bar=False,  # we have our own progress printing
+    )
+
+    # ---- Save final model ----
+    model.save(model_save_path)
+    print("\n" + "-" * 50)
+    print(f"  Training complete!")
+    print(f"  Final model saved: {model_save_path}.zip")
+    print(f"  Best model saved: {model_save_path}_best/")
+    print("=" * 50)
+
+    return model
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------------------------------------------------ #
+#  Evaluation helper                                                  #
+# ------------------------------------------------------------------ #
+
+def evaluate_model(model_path, data_path, config_path="config/config.yaml", n_episodes=20):
+    """
+    Load a saved model and evaluate it.
+    Prints success rate, mean reward, and mean steps.
+    """
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    env_config = {
+        "max_battery": config["environment"]["max_battery"],
+        "max_steps": config["environment"].get("max_steps_per_episode", 100),
+        "reward": config["environment"]["reward"],
+    }
+
+    env = MedSwarmEnv(data_path=data_path, config=env_config)
+
+    try:
+        model = PPO.load(model_path)
+    except FileNotFoundError:
+        print(f"  Model not found at {model_path}")
+        print("  Run 'python scripts/train.py' first!")
+        return None
+
+    print(f"\nEvaluating model over {n_episodes} episodes...")
+
+    all_rewards = []
+    all_steps = []
+    successes = 0
+
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        ep_reward = 0.0
+        step = 0
+        done = False
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_reward += reward
+            step += 1
+            done = terminated or truncated
+
+        all_rewards.append(ep_reward)
+        all_steps.append(step)
+        if info["zones_done"] == env.num_zones:
+            successes += 1
+
+    print(f"  Mean reward:      {np.mean(all_rewards):>8.1f}")
+    print(f"  Mean steps:       {np.mean(all_steps):>8.1f}")
+    print(f"  Success rate:     {successes / n_episodes * 100:>7.1f}%")
+    print(f"  Min/Max reward:   {np.min(all_rewards):.1f} / {np.max(all_rewards):.1f}")
+
+    return {
+        "mean_reward": np.mean(all_rewards),
+        "mean_steps": np.mean(all_steps),
+        "success_rate": successes / n_episodes,
+        "all_rewards": all_rewards,
+    }

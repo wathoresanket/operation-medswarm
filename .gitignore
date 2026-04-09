@@ -1,79 +1,34 @@
-# =============================================================================
-# MedSwarm .gitignore
-# =============================================================================
+# python stuff
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
 
-# Python Virtual Environments
+# virtual env
 venv/
 env/
 .venv/
-ENV/
 
-# Python Cache & Compiled Files
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-
-# Distribution / Packaging
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Project Specific - Generated Data & Models
+# generated during runtime — don't commit these
 data/
 models/
 logs/
-outputs/
 
-# Jupyter Notebooks
-.ipynb_checkpoints
-*.ipynb_checkpoints
+# jupyter
+.ipynb_checkpoints/
+*.ipynb
 
-# IDE Settings
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS Generated Files
+# OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Testing & Coverage
-.coverage
-.pytest_cache/
-htmlcov/
-.tox/
-.nox/
+# IDE
+.vscode/
+.idea/
 
-# Type Checkers
-.mypy_cache/
-.pytype/
-
-# Documentation
-docs/_build/
-
-# Environment Variables
+# secrets
 .env
-.env.local
-*.env
+*.key

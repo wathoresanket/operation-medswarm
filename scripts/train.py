@@ -1,155 +1,75 @@
-#!/usr/bin/env python
 """
-CLI Script for Training
-========================
-Train the MedSwarm PPO agent.
+train.py
+
+Step 2 of the pipeline.
+
+Trains the PPO agent on the MedSwarm environment.
+
+This will take ~10-20 minutes depending on your machine.
+The agent starts out terrible (random actions), and gradually learns
+to coordinate the ambulance and drone to cover all 12 zones efficiently.
+
+Usage:
+    python scripts/train.py
+    python scripts/train.py --config config/config.yaml
+    python scripts/train.py --evaluate   # skip training, just evaluate existing model
 """
 
-import argparse
 import sys
 import os
+import argparse
 
-# Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from medswarm.training.trainer import MedSwarmTrainer, TrainingConfig
+from medswarm.training.trainer import train, evaluate_model
+from medswarm.utils.helpers import load_config, plot_training_curve
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train the MedSwarm PPO reinforcement learning agent",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python scripts/train.py
-  python scripts/train.py --timesteps 500000 --lr 0.0001
-  python scripts/train.py --n-envs 8 --eval-freq 10000
-        """
-    )
-    
-    # Training parameters
+    parser = argparse.ArgumentParser(description="Train MedSwarm PPO agent")
     parser.add_argument(
-        "--timesteps", 
-        type=int, 
-        default=300000,
-        help="Total training timesteps (default: 300000)"
-    )
-    parser.add_argument(
-        "--lr", 
-        type=float, 
-        default=0.0003,
-        help="Learning rate (default: 0.0003)"
-    )
-    parser.add_argument(
-        "--n-envs", 
-        type=int, 
-        default=4,
-        help="Number of parallel environments (default: 4)"
-    )
-    parser.add_argument(
-        "--n-steps", 
-        type=int, 
-        default=2048,
-        help="Number of steps per rollout (default: 2048)"
-    )
-    parser.add_argument(
-        "--batch-size", 
-        type=int, 
-        default=64,
-        help="Minibatch size (default: 64)"
-    )
-    
-    # Evaluation parameters
-    parser.add_argument(
-        "--eval-freq", 
-        type=int, 
-        default=5000,
-        help="Evaluation frequency in timesteps (default: 5000)"
-    )
-    parser.add_argument(
-        "--eval-episodes", 
-        type=int, 
-        default=10,
-        help="Number of evaluation episodes (default: 10)"
-    )
-    
-    # Paths
-    parser.add_argument(
-        "--data-path", 
-        default="data/medswarm_data.pkl",
-        help="Path to data file (default: data/medswarm_data.pkl)"
-    )
-    parser.add_argument(
-        "--log-path", 
-        default="logs/",
-        help="Path for logs (default: logs/)"
-    )
-    parser.add_argument(
-        "--model-path", 
-        default="models/",
-        help="Path for models (default: models/)"
-    )
-    
-    # Options
-    parser.add_argument(
-        "--evaluate-only", 
-        action="store_true",
-        help="Only evaluate, don't train"
-    )
-    parser.add_argument(
-        "--load-model", 
+        "--config",
         type=str,
-        help="Path to pre-trained model to load"
+        default="config/config.yaml",
+        help="Path to config file",
     )
     parser.add_argument(
-        "--verbose", 
-        type=int, 
-        default=1,
-        choices=[0, 1, 2],
-        help="Verbosity level (default: 1)"
+        "--evaluate",
+        action="store_true",
+        help="Skip training, just evaluate the saved model",
     )
-    
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=20,
+        help="Number of eval episodes (default: 20)",
+    )
     args = parser.parse_args()
-    
-    # Check if data exists
-    if not os.path.exists(args.data_path):
-        print(f"\n❌ Data file not found: {args.data_path}")
-        print("   Run 'python scripts/prepare_data.py' first to prepare the data.\n")
-        sys.exit(1)
-    
-    # Create config
-    config = TrainingConfig(
-        total_timesteps=args.timesteps,
-        learning_rate=args.lr,
-        n_envs=args.n_envs,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        eval_freq=args.eval_freq,
-        n_eval_episodes=args.eval_episodes,
-        data_path=args.data_path,
-        log_path=args.log_path,
-        model_path=args.model_path,
-        verbose=args.verbose
-    )
-    
-    # Initialize trainer
-    trainer = MedSwarmTrainer(config)
-    
-    # Load model if specified
-    if args.load_model:
-        trainer.load_model(args.load_model)
-    
-    # Train or evaluate
-    if args.evaluate_only:
-        if trainer.model is None:
-            print("\n❌ No model loaded. Use --load-model to specify a model.\n")
-            sys.exit(1)
-        trainer.evaluate(n_episodes=args.eval_episodes, render=True)
+
+    config = load_config(args.config)
+    data_path = config["data"]["output_path"]
+    model_path = config["training"]["model_save_path"]
+    log_path = config["training"]["log_path"]
+
+    if not args.evaluate:
+        # run training
+        model = train(config_path=args.config)
+
+        # evaluate right after training
+        print("\nRunning post-training evaluation...")
+        results = evaluate_model(model_path, data_path, args.config, n_episodes=args.episodes)
+
+        # save training curve as a PNG
+        plot_training_curve(log_path, save_path="logs/training_curve.png")
+        print("\nTraining curve saved to logs/training_curve.png")
+        print("Now run: python scripts/run_dashboard.py")
+
     else:
-        trainer.train()
-        trainer.evaluate(n_episodes=args.eval_episodes)
-    
-    print("\n✅ Done!\n")
+        # just evaluate existing model
+        print("Skipping training — evaluating existing model...")
+        results = evaluate_model(model_path, data_path, args.config, n_episodes=args.episodes)
+        if results is None:
+            print("No model found. Train first with: python scripts/train.py")
 
 
 if __name__ == "__main__":

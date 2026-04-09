@@ -1,5 +1,3 @@
-"""Training module for MedSwarm."""
+from medswarm.training.trainer import train, evaluate_model
 
-from medswarm.training.trainer import MedSwarmTrainer, TrainingConfig
-
-__all__ = ["MedSwarmTrainer", "TrainingConfig"]
+__all__ = ["train", "evaluate_model"]
