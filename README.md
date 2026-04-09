@@ -300,11 +300,11 @@ Timestep    | Zones/Episode | Success Rate | Mean Reward
 python scripts/run_dashboard.py
 ```
 
-Opens interactive Streamlit dashboard showing:
-- **Training curves** (reward, zones, success rate over time)
-- **Live mission replay** (watch trained agent solve a mission)
-- **Statistics panel** (episode metrics, battery usage, zone completion heatmap)
-- **Policy heatmap** (which zones does agent prefer to visit first)
+Opens interactive **Gradio** dashboard at `http://localhost:7860` with:
+- **🎬 Mission Replay** — Watch trained agent solve a disaster mission live
+- **📊 Training Progress** — View reward curves and convergence metrics
+- **ℹ️ Environment Info** — Detailed configuration and problem setup
+- **❓ Help** — Quick start guide and troubleshooting
 
 ---
 
@@ -333,7 +333,7 @@ medswarm/
 │   │   └── helpers.py                 ← Utility functions
 │   └── visualization/
 │       ├── __init__.py
-│       └── dashboard.py               ← Streamlit interactive dashboard
+│       └── dashboard.py               ← Gradio interactive dashboard
 ├── scripts/
 │   ├── prepare_data.py                ← Run this first (preparation)
 │   ├── train.py                       ← Run this second (training)
@@ -623,7 +623,7 @@ python scripts/train.py 2>&1 | grep "Success"
 | **Map Data** | osmnx | 1.6+ | OpenStreetMap network downloads |
 | **Data Processing** | numpy | 1.24+ | Numerical arrays |
 | | pandas | 2.0+ | DataFrames (optional, for analysis) |
-| **Visualization** | streamlit | 1.28+ | Interactive dashboard |
+| **Visualization** | gradio | 5.7+ | Interactive dashboard (lightweight, faster) |
 | | plotly | 5.17+ | Advanced plotting |
 | | matplotlib | 3.7+ | Static plots |
 | **Config Management** | pyyaml | 6.0+ | YAML parsing |
