@@ -5,27 +5,33 @@ data:
   output_path: "data/medswarm_data.pkl"
 
 environment:
-  max_battery: 3000.0        # meters — drone dies if it goes beyond this
-  max_steps_per_episode: 100 # cut off long episodes
+  max_battery: 5000.0        # increased battery for more exploration
+  max_steps_per_episode: 200 # doubled steps to allow full zone exploration
   reward:
-    distance_penalty: -0.1   # per meter traveled (both agents)
-    zone_stabilized: 100.0   # bonus for each zone reached
-    battery_failure: -2000.0 # drone ran out of juice — big penalty
-    mission_complete: 5000.0 # all 12 zones done — jackpot
+    # FIXED: Removed distance penalty (it rewards inaction)
+    # Instead use per-step cost to encourage efficiency
+    per_step_penalty: -0.5   # -0.5 per step pushes agent to complete quickly
+    zone_stabilized: 300.0   # increased to 300 — PRIMARY reward signal
+    battery_failure: -5000.0 # increased to -5000 — hard constraint
+    mission_complete: 8000.0 # bonus for full completion (but zones are main reward)
 
 training:
-  total_timesteps: 300000
-  learning_rate: 0.0003
+  total_timesteps: 300000  # full training
+  learning_rate: 0.0005    # slightly higher learning rate
   n_steps: 2048
   batch_size: 64
   n_epochs: 10
   gamma: 0.99
+  gae_lambda: 0.95        # for better advantage estimation
   clip_range: 0.2
+  ent_coef: 0.05          # INCREASED entropy bonus (was 0.01) → encourages exploration
   n_envs: 4               # parallel envs for faster training
   model_save_path: "models/ppo_medswarm"
   log_path: "logs/"
-  eval_freq: 10000         # evaluate every N steps
+  eval_freq: 10000        # evaluate every N steps
   eval_episodes: 20
+  # Note: Custom neural network architecture is set in trainer.py
+  # Policy uses 3-layer MLP: [256, 256, 128] for better representation learning
 
 dashboard:
   port: 8501

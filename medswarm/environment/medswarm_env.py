@@ -40,13 +40,13 @@ class MedSwarmEnv(gym.Env):
         # load default config if none provided
         if config is None:
             config = {
-                "max_battery": 3000.0,
-                "max_steps": 100,
+                "max_battery": 5000.0,
+                "max_steps": 200,
                 "reward": {
-                    "distance_penalty": -0.1,
-                    "zone_stabilized": 100.0,
-                    "battery_failure": -2000.0,
-                    "mission_complete": 5000.0,
+                    "per_step_penalty": -0.5,
+                    "zone_stabilized": 300.0,
+                    "battery_failure": -5000.0,
+                    "mission_complete": 8000.0,
                 },
             }
 
@@ -58,19 +58,24 @@ class MedSwarmEnv(gym.Env):
         with open(data_path, "rb") as f:
             map_data = pickle.load(f)
 
-        self.hospital_idx = map_data["hospital_idx"]
-        self.zone_indices = map_data["zone_indices"]
+        # Map keys from data_prep.py output
+        self.hospital_idx = 0  # hospital is always at index 0 in all_nodes list
+        self.zone_indices = list(range(1, len(map_data["zone_nodes"]) + 1))  # zones are at indices 1-12
         self.num_zones = len(self.zone_indices)
-        self.num_nodes = len(map_data["nodes"])  # hospital + zones = 13 nodes
+        self.num_nodes = len(map_data["all_nodes"])  # hospital + zones = 13 nodes
 
         # distance matrices
-        # ambulance uses road_dist (real roads), drone uses euclidean_dist (straight line)
-        self.road_dist = map_data["road_dist"].astype(np.float32)
-        self.euclidean_dist = map_data["euclidean_dist"].astype(np.float32)
+        # ambulance uses ambulance_matrix (real roads), drone uses drone_matrix (straight line)
+        self.road_dist = map_data["ambulance_matrix"].astype(np.float32)
+        self.euclidean_dist = map_data["drone_matrix"].astype(np.float32)
+        
+        # Store original distances for randomization per episode
+        self._road_dist_orig = self.road_dist.copy()
+        self._euclidean_dist_orig = self.euclidean_dist.copy()
 
         # store coords for rendering
-        self.coords = map_data.get("coords", {})
-        self.nodes = map_data["nodes"]
+        self.coords = map_data.get("node_coords", {})
+        self.nodes = map_data["all_nodes"]
 
         # ---- Action Space ----
         # Each agent picks which node to go to next (hospital = 0, zones = 1-12)
@@ -80,13 +85,17 @@ class MedSwarmEnv(gym.Env):
 
         # ---- Observation Space ----
         # What the agent "sees" each step:
-        # [ambulance_pos, drone_pos, drone_battery_normalized, zone_1_done, ..., zone_12_done]
-        # Total: 1 + 1 + 1 + 12 = 15 values
-        obs_low  = np.zeros(3 + self.num_zones, dtype=np.float32)
-        obs_high = np.ones(3 + self.num_zones, dtype=np.float32)
-        obs_high[0] = self.num_nodes - 1  # ambulance position
-        obs_high[1] = self.num_nodes - 1  # drone position
+        # [ambulance_pos, drone_pos, drone_battery_normalized, zones_remaining, 
+        #  dist_to_nearest_zone_ambulance, dist_to_nearest_zone_drone, zone_1_done, ..., zone_12_done]
+        # Total: 1 + 1 + 1 + 1 + 1 + 1 + 12 = 18 values (was 15)
+        obs_low  = np.zeros(6 + self.num_zones, dtype=np.float32)
+        obs_high = np.ones(6 + self.num_zones, dtype=np.float32)
+        obs_high[0] = self.num_nodes - 1  # ambulance position (0-12)
+        obs_high[1] = self.num_nodes - 1  # drone position (0-12)
         obs_high[2] = 1.0                 # battery as fraction (0.0 to 1.0)
+        obs_high[3] = self.num_zones      # zones remaining (0-12)
+        obs_high[4] = self.max_battery    # dist to nearest unvisited zone for ambulance (0-max_dist)
+        obs_high[5] = self.max_battery    # dist to nearest unvisited zone for drone (0-max_dist)
 
         self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
@@ -107,7 +116,17 @@ class MedSwarmEnv(gym.Env):
         # both agents start at the hospital
         self._ambulance_pos = self.hospital_idx
         self._drone_pos = self.hospital_idx
-        self._battery_left = self.max_battery
+        
+        # Randomize initial battery to create episode variety
+        # This is realistic - different disasters have different resource availability
+        battery_variance = np.random.uniform(0.75, 1.0)
+        self._battery_left = self.max_battery * battery_variance
+        
+        # Randomize travel distances (0.95-1.05x normal) to simulate traffic/weather
+        distance_variance = np.random.uniform(0.95, 1.05)
+        self.road_dist = (self._road_dist_orig * distance_variance).astype(np.float32)
+        self.euclidean_dist = (self._euclidean_dist_orig * distance_variance).astype(np.float32)
+        
         self._zones_done = np.zeros(self.num_zones, dtype=np.float32)
         self._step_count = 0
 
@@ -126,9 +145,13 @@ class MedSwarmEnv(gym.Env):
         terminated = False  # episode ended naturally (success or failure)
         truncated = False   # episode cut off by step limit
 
+        # Apply per-step penalty to encourage efficiency (must be earned back via zone completion)
+        reward += self.reward_cfg.get("per_step_penalty", 0.0)
+
         # ---- Move Ambulance ----
         amb_dist = self.road_dist[self._ambulance_pos][amb_target]
-        reward += amb_dist * self.reward_cfg["distance_penalty"]
+        # FIXED: removed distance_penalty — it was rewarding inaction
+        # Movement cost is now implicit in per_step_penalty
         self._ambulance_pos = amb_target
 
         # check if ambulance just stabilized a zone
@@ -185,11 +208,28 @@ class MedSwarmEnv(gym.Env):
     # ------------------------------------------------------------------ #
 
     def _get_obs(self):
-        obs = np.zeros(3 + self.num_zones, dtype=np.float32)
+        obs = np.zeros(6 + self.num_zones, dtype=np.float32)
         obs[0] = float(self._ambulance_pos)
         obs[1] = float(self._drone_pos)
         obs[2] = self._battery_left / self.max_battery  # normalize to 0-1
-        obs[3:] = self._zones_done
+        obs[3] = float(self.num_zones - np.sum(self._zones_done))  # zones remaining
+        
+        # Distance to nearest unvisited zone for ambulance
+        unvisited_indices = [i for i, done in enumerate(self._zones_done) if done == 0.0]
+        if unvisited_indices:
+            distances = [self.road_dist[self._ambulance_pos][self.zone_indices[i]] for i in unvisited_indices]
+            obs[4] = float(min(distances))
+        else:
+            obs[4] = 0.0
+        
+        # Distance to nearest unvisited zone for drone
+        if unvisited_indices:
+            distances = [self.euclidean_dist[self._drone_pos][self.zone_indices[i]] for i in unvisited_indices]
+            obs[5] = float(min(distances))
+        else:
+            obs[5] = 0.0
+        
+        obs[6:] = self._zones_done
         return obs
 
     # ------------------------------------------------------------------ #

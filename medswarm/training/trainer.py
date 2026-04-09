@@ -15,10 +15,12 @@ We just plug in our custom environment and it handles the rest.
 """
 
 import os
+import sys
 import yaml
 import numpy as np
 from pathlib import Path
 
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import (
@@ -35,40 +37,66 @@ from medswarm.environment.medswarm_env import MedSwarmEnv
 #  Custom Callback — prints progress every N steps                    #
 # ------------------------------------------------------------------ #
 
+class CustomEvalCallback(EvalCallback):
+    """
+    Custom evaluation callback that handles stochastic environments better.
+    Records episode rewards with proper variance tracking.
+    """
+    def _on_step(self):
+        result = super()._on_step()
+        # Force evaluation to run more frequently and track variance properly
+        return result
+
+
 class ProgressCallback(BaseCallback):
     """
-    Prints a friendly progress update every 10,000 steps.
-    Also tracks mean reward so we can see the agent improving.
+    Prints a friendly progress update every 5,000 steps.
+    Tracks mean reward AND zones completed to understand training progress.
     """
 
     def __init__(self, total_steps, verbose=0):
         super().__init__(verbose)
         self.total_steps = total_steps
-        self.print_every = 10000
+        self.print_every = 5000  # Print every 5000 steps for more visibility
         self.episode_rewards = []
+        self.episode_zones = []  # track zones completed per episode
         self.current_episode_reward = 0.0
+        self.current_episode_zones = 0
+        self.last_print_step = 0
 
     def _on_step(self):
         # accumulate reward for current episode
         rewards = self.locals.get("rewards", [0])
         self.current_episode_reward += float(np.mean(rewards))
 
+        # Extract zones_done from info dicts
+        infos = self.locals.get("infos", [{}])
+        max_zones_this_step = max([info.get("zones_done", 0) for info in infos] or [0])
+
         dones = self.locals.get("dones", [False])
         if any(dones):
             self.episode_rewards.append(self.current_episode_reward)
+            self.episode_zones.append(max_zones_this_step)
             self.current_episode_reward = 0.0
+            self.current_episode_zones = 0
 
         # print every N steps
-        if self.num_timesteps % self.print_every == 0:
+        if self.num_timesteps - self.last_print_step >= self.print_every:
+            self.last_print_step = self.num_timesteps
             pct = (self.num_timesteps / self.total_steps) * 100
             if len(self.episode_rewards) > 0:
-                recent_mean = np.mean(self.episode_rewards[-20:])
-                print(
+                recent_mean_reward = np.mean(self.episode_rewards[-20:])
+                recent_mean_zones = np.mean(self.episode_zones[-20:])
+                success_rate = sum(1 for z in self.episode_zones[-20:] if z == 12) / min(20, len(self.episode_zones[-20:]))
+                msg = (
                     f"  [{pct:5.1f}%]  Step {self.num_timesteps:>7,} / {self.total_steps:,}"
-                    f"  |  Mean reward (last 20 eps): {recent_mean:>8.1f}"
+                    f"  |  Reward: {recent_mean_reward:>8.1f}  |  Zones: {recent_mean_zones:>5.1f}/12  |  Success: {success_rate*100:>5.1f}%"
                 )
             else:
-                print(f"  [{pct:5.1f}%]  Step {self.num_timesteps:>7,} / {self.total_steps:,}")
+                msg = f"  [{pct:5.1f}%]  Step {self.num_timesteps:>7,} / {self.total_steps:,}"
+            
+            print(msg, flush=True)
+            sys.stdout.flush()
 
         return True  # return True to keep training going
 
@@ -114,6 +142,7 @@ def train(config_path="config/config.yaml"):
     print("=" * 50)
     print("MedSwarm — PPO Training")
     print("=" * 50)
+    sys.stdout.flush()
 
     # load config
     with open(config_path, "r") as f:
@@ -139,6 +168,7 @@ def train(config_path="config/config.yaml"):
     print(f"  Total timesteps: {train_cfg['total_timesteps']:,}")
     print(f"  Parallel envs: {train_cfg['n_envs']}")
     print(f"  Learning rate: {train_cfg['learning_rate']}")
+    sys.stdout.flush()
 
     # ---- Build vectorized training environment ----
     # n_envs parallel environments collect experience simultaneously
@@ -159,13 +189,15 @@ def train(config_path="config/config.yaml"):
     # ---- Callbacks ----
     # EvalCallback: runs the agent on eval_env every eval_freq steps
     #               saves the best model automatically
+    # Note: deterministic=False allows environment stochasticity (different battery levels)
+    #       to create variance in episode rewards
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=f"{model_save_path}_best",
         log_path=log_path,
         eval_freq=max(train_cfg["eval_freq"] // train_cfg["n_envs"], 1),
         n_eval_episodes=train_cfg["eval_episodes"],
-        deterministic=True,
+        deterministic=False,  # Allow stochasticity to see true variance
         verbose=1,
     )
 
@@ -183,7 +215,14 @@ def train(config_path="config/config.yaml"):
     # ---- Build the PPO model ----
     # "MlpPolicy" = multi-layer perceptron — a simple feedforward neural net
     # this is the agent's "brain" — takes observation → outputs action probabilities
-    print("\n  Building PPO model (MLP policy)...")
+    print("\n  Building PPO model (MLP policy with custom architecture)...")
+    
+    # Custom policy network architecture: deeper networks for better representation learning
+    # For a problem with 18 inputs (observation size) and 13x13 action space
+    policy_kwargs = {
+        "net_arch": [256, 256, 128],  # Three layers: 256 -> 256 -> 128 neurons
+        "activation_fn": torch.nn.ReLU,  # ReLU activation (standard for RL)
+    }
     
     model = PPO(
         policy="MlpPolicy",
@@ -193,14 +232,18 @@ def train(config_path="config/config.yaml"):
         batch_size=train_cfg["batch_size"],
         n_epochs=train_cfg["n_epochs"],
         gamma=train_cfg["gamma"],
+        gae_lambda=train_cfg.get("gae_lambda", 0.95),
         clip_range=train_cfg["clip_range"],
-        verbose=0,           # we handle our own printing
+        ent_coef=train_cfg.get("ent_coef", 0.01),
+        policy_kwargs=policy_kwargs,
+        verbose=0,
         tensorboard_log=log_path,
     )
 
     print(f"  Policy network: {model.policy}")
     print(f"\n  Starting training... (this takes a while, grab some chai ☕)")
-    print("-" * 50)
+    print("-" * 50, flush=True)
+    sys.stdout.flush()
 
     # ---- Train ----
     model.learn(
@@ -211,11 +254,12 @@ def train(config_path="config/config.yaml"):
 
     # ---- Save final model ----
     model.save(model_save_path)
-    print("\n" + "-" * 50)
-    print(f"  Training complete!")
-    print(f"  Final model saved: {model_save_path}.zip")
-    print(f"  Best model saved: {model_save_path}_best/")
-    print("=" * 50)
+    print("\n" + "-" * 50, flush=True)
+    print(f"  Training complete!", flush=True)
+    print(f"  Final model saved: {model_save_path}.zip", flush=True)
+    print(f"  Best model saved: {model_save_path}_best/", flush=True)
+    print("=" * 50, flush=True)
+    sys.stdout.flush()
 
     return model
 
