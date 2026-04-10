@@ -18,7 +18,6 @@ ENV/
 *.swo
 
 # Auto-generated from training
-models/
 logs/
 data/medswarm_data.pkl
 
